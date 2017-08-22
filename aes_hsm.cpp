@@ -1,31 +1,51 @@
 #include <cassert>
 #include <stdio.h>
-#include <openssl/conf.h>
+#include <mutex>
 
 #include <string>
 #include <vector>
 
-#include "cryptoki.h"
 #include "pkcs11.h"
+
+static CK_FUNCTION_LIST_PTR p11 = NULL_PTR;
+
+extern "C" void *C_LoadModule(const char *name, CK_FUNCTION_LIST_PTR_PTR);
+extern "C" CK_RV C_UnloadModule(void *module);
 
 typedef std::vector<CK_BYTE> BYTE_VEC;
 typedef std::vector<CK_ATTRIBUTE> ATTR_VEC;
 
-static CK_BBOOL bTrue = TRUE;
-static CK_BBOOL bFalse = FALSE;
+static CK_BBOOL bTrue = true;
+static CK_BBOOL bFalse = true;
 static CK_BYTE ApplicationID = 1;
 
 static CK_OBJECT_CLASS KeyClass = CKO_SECRET_KEY;
 static CK_KEY_TYPE KeyType = CKK_AES;
 static CK_ULONG KeyLen = 32;
 
+std::string errorName(CK_RV rv)
+{
+    switch(rv)
+    {
+        case 3:
+            return "CKR_SLOT_ID_INVALID";
+        case 6:
+            return "CKR_FUNCTION_FAILED";
+        case 7:
+            return "CKR_ARGUMENTS_BAD";
+        case 400:
+            return "CKR_CRYPTOKI_NOT_INITIALIZED";
+    }
+
+    return "Unknown";
+}
 
 // ---------------------------------------------------------------------------------------------------- 
 void checkRV(CK_RV rv, const char* msg)
 {
     if (rv != CKR_OK)
     {
-        printf("%s: %d\n", msg, rv);
+        printf("%s: %d (%s)\n", msg, rv, errorName(rv).c_str());
     }
     assert(rv == CKR_OK);
 }
@@ -35,12 +55,9 @@ void checkRV(CK_RV rv, CK_SESSION_HANDLE& hSession, const char* msg)
 {
     if (rv != CKR_OK)
     {
-        printf("%s: %d\n", msg, rv);
-        if (hSession != NULL_PTR)
-        {
-            C_Logout(hSession);
-            C_CloseSession(hSession);
-        }
+        printf("%s: %d (%s)\n", msg, rv, errorName(rv).c_str());
+        p11->C_Logout(hSession);
+        p11->C_CloseSession(hSession);
     }
     assert(rv == CKR_OK);
 }
@@ -50,22 +67,26 @@ void printSlots()
 {
     CK_RV rv;
     CK_ULONG slotCnt;
-    rv = C_GetSlotList(CK_FALSE, NULL_PTR, &slotCnt);
+    rv = p11->C_GetSlotList(CK_FALSE, nullptr, &slotCnt);
     checkRV(rv, "C_GetSlotList to obtain count failed");
 
     std::vector<CK_SLOT_ID> slotList(slotCnt);
-    rv = C_GetSlotList(CK_FALSE, slotList.data(), &slotCnt);
+    rv = p11->C_GetSlotList(CK_FALSE, slotList.data(), &slotCnt);
     checkRV(rv, "C_GetSlotList failed");
+    if (slotList.size() == 0)
+    {
+        printf("No available slots.\n");
+    }
     for (auto& slot : slotList)
     {
         CK_SLOT_INFO slotInfo;
-        rv = C_GetSlotInfo(slot, &slotInfo);
+        rv = p11->C_GetSlotInfo(slot, &slotInfo);
         checkRV(rv, "C_GetSlotInfo failed");
 
         printf("%.64s\n", slotInfo.slotDescription);
 
         CK_TOKEN_INFO tokenInfo;
-        rv = C_GetTokenInfo(slot, &tokenInfo);
+        rv = p11->C_GetTokenInfo(slot, &tokenInfo);
         checkRV(rv, "C_GetTokenInfo failed");
 
         printf("\ttoken: %.32s\n", tokenInfo.label);
@@ -79,10 +100,10 @@ void createSessionAndLogin(CK_SLOT_ID slotID, const std::string& pin, CK_SESSION
     std::vector<CK_UTF8CHAR> userPIN(pin.begin(), pin.end());
 
     CK_RV rv;
-    rv = C_OpenSession(slotID, CKF_SERIAL_SESSION | CKF_RW_SESSION, (CK_VOID_PTR)&ApplicationID, NULL_PTR, &hSession);
+    rv = p11->C_OpenSession(slotID, CKF_SERIAL_SESSION | CKF_RW_SESSION, (CK_VOID_PTR)&ApplicationID, nullptr, &hSession);
     checkRV(rv, hSession, "C_OpenSession failed");
 
-    rv = C_Login(hSession, CKU_USER, userPIN.data(), pin.size());
+    rv = p11->C_Login(hSession, CKU_USER, userPIN.data(), pin.size());
     checkRV(rv, hSession, "C_Login failed");
 }
 
@@ -91,15 +112,16 @@ void generateKey(CK_SESSION_HANDLE& hSession, const std::string& label, CK_OBJEC
 {
     CK_RV rv;
     CK_MECHANISM mechanism = {
-        CKM_AES_KEY_GEN, NULL_PTR, 0
+        CKM_AES_KEY_GEN, nullptr, 0
     };
 
     BYTE_VEC keyLabel(label.begin(), label.end());
     ATTR_VEC attrs = {
         { CKA_CLASS, &KeyClass, sizeof(KeyClass ) },
-        { CKA_TOKEN, &bTrue, sizeof(bTrue ) },
+        { CKA_TOKEN, &bTrue, sizeof(bTrue) },
         { CKA_PRIVATE, &bTrue, sizeof(bTrue) },
         { CKA_LABEL, keyLabel.data(), keyLabel.size() },
+        { CKA_ID, keyLabel.data(), keyLabel.size()},
         { CKA_MODIFIABLE, &bFalse, sizeof(bFalse) },
         { CKA_KEY_TYPE, &KeyType, sizeof(KeyType ) },
         { CKA_ENCRYPT, &bTrue, sizeof(bTrue ) },
@@ -107,7 +129,7 @@ void generateKey(CK_SESSION_HANDLE& hSession, const std::string& label, CK_OBJEC
         { CKA_VALUE_LEN, &KeyLen, sizeof(KeyLen ) }
     };
 
-    rv = C_GenerateKey(hSession, &mechanism, attrs.data(), attrs.size(), &hKey);
+    rv = p11->C_GenerateKey(hSession, &mechanism, attrs.data(), attrs.size(), &hKey);
     checkRV(rv, hSession, "C_GenerateKey failed");
 }
 
@@ -124,7 +146,7 @@ void createKeyObject(CK_SESSION_HANDLE& hSession, CK_OBJECT_HANDLE& hKey)
         {CKA_ENCRYPT, &bTrue, sizeof(bTrue) }
     };
 
-    rv = C_CreateObject(hSession, attrs.data(), attrs.size(), &hKey);
+    rv = p11->C_CreateObject(hSession, attrs.data(), attrs.size(), &hKey);
     checkRV(rv, hSession, "C_CreateObject failed");
 }
 
@@ -138,7 +160,7 @@ void findObjects(CK_SESSION_HANDLE& hSession, const std::string& label, CK_OBJEC
         { CKA_LABEL, keyLabel.data(), keyLabel.size() },
     };
 
-    rv = C_FindObjectsInit(hSession, attrs.data(), attrs.size());
+    rv = p11->C_FindObjectsInit(hSession, attrs.data(), attrs.size());
     checkRV(rv, hSession, "C_FindObjectsInit failed");
 
     const size_t maxObjectsToFind = 16;
@@ -146,7 +168,7 @@ void findObjects(CK_SESSION_HANDLE& hSession, const std::string& label, CK_OBJEC
     CK_ULONG objCnt;
     while (1)
     {
-        rv = C_FindObjects(hSession, objectList.data(), maxObjectsToFind, &objCnt);
+        rv = p11->C_FindObjects(hSession, objectList.data(), maxObjectsToFind, &objCnt);
         objectList.resize(objCnt);
         checkRV(rv, hSession, "C_FindObjects failed");
         if (objCnt == 0)
@@ -158,12 +180,12 @@ void findObjects(CK_SESSION_HANDLE& hSession, const std::string& label, CK_OBJEC
             hKey = obj;
 
             CK_ULONG ulSize;
-            rv = C_GetObjectSize(hSession, hKey, &ulSize);
+            rv = p11->C_GetObjectSize(hSession, hKey, &ulSize);
             printf("key size=%lu\n", ulSize);
         }
     }
 
-    rv = C_FindObjectsFinal(hSession);
+    rv = p11->C_FindObjectsFinal(hSession);
     checkRV(rv, hSession, "C_FindObjectsFinal failed");
 }
 
@@ -176,7 +198,7 @@ void encrypt(CK_SESSION_HANDLE& hSession, CK_OBJECT_HANDLE& hKey, BYTE_VEC& cyph
         CKM_AES_ECB, NULL_PTR, 0
     };
     
-    rv = C_EncryptInit(hSession, &mechanism, hKey);
+    rv = p11->C_EncryptInit(hSession, &mechanism, hKey);
     checkRV(rv, hSession, "C_EncryptInit failed");
 
     // must be multiple of block size (32 in our case)
@@ -187,18 +209,18 @@ void encrypt(CK_SESSION_HANDLE& hSession, CK_OBJECT_HANDLE& hKey, BYTE_VEC& cyph
 
     CK_ULONG cypherLen;
     // figure out the cypher len first
-    rv = C_Encrypt(hSession, plainText.data(), plainText.size(), NULL_PTR, &cypherLen);
+    rv = p11->C_Encrypt(hSession, plainText.data(), plainText.size(), nullptr, &cypherLen);
     checkRV(rv, hSession, "C_Encrypt 1 failed");
 
     printf("cypher len = %u\n", cypherLen);
     cypher.resize(cypherLen);
 
     // encryption itself
-    rv = C_Encrypt(hSession, plainText.data(), plainText.size(), cypher.data(), &cypherLen);
+    rv = p11->C_Encrypt(hSession, plainText.data(), plainText.size(), cypher.data(), &cypherLen);
     checkRV(rv, hSession, "C_Encrypt 2 failed");
 
     // No need to finalize for single encrypt
-    //rv = C_EncryptFinal(hSession, NULL_PTR, 0);
+    //rv = p11->C_EncryptFinal(hSession, nullptr, 0));
     //checkRV(rv, hSession, "C_EncryptFinal failed");
 }
 
@@ -211,46 +233,90 @@ void decrypt(CK_SESSION_HANDLE& hSession, const BYTE_VEC& cypher, CK_OBJECT_HAND
         CKM_AES_ECB, NULL_PTR, 0
     };
 
-    rv = C_DecryptInit(hSession, &mechanism, hKey);
+    rv = p11->C_DecryptInit(hSession, &mechanism, hKey);
     checkRV(rv, hSession, "C_DecryptInit failed");
 
     CK_ULONG plainLen;
-    rv = C_Decrypt(hSession, const_cast<CK_BYTE*>(cypher.data()), cypher.size(), NULL_PTR, &plainLen);
+    rv = p11->C_Decrypt(hSession, const_cast<CK_BYTE*>(cypher.data()), cypher.size(), nullptr, &plainLen);
     checkRV(rv, hSession, "C_Decrypt 1 failed");
 
     BYTE_VEC decoded(plainLen);
-    rv = C_Decrypt(hSession, const_cast<CK_BYTE*>(cypher.data()), cypher.size(), decoded.data(), &plainLen);
+    rv = p11->C_Decrypt(hSession, const_cast<CK_BYTE*>(cypher.data()), cypher.size(), decoded.data(), &plainLen);
     checkRV(rv, hSession, "C_Decrypt 2 failed");
 
     printf("Decoded: %s\n", decoded.data());
 }
 
 // ---------------------------------------------------------------------------------------------------- 
-int main()
+CK_RV customCreateMutex(CK_VOID_PTR_PTR ppMutex)
 {
+    *ppMutex = new std::mutex();
+    return CKR_OK;
+}
+
+// ---------------------------------------------------------------------------------------------------- 
+CK_RV customDestroyMutex(CK_VOID_PTR pMutex)
+{
+    delete static_cast<std::mutex*>(pMutex);
+    return CKR_OK;
+}
+
+// ---------------------------------------------------------------------------------------------------- 
+CK_RV customLockMutex(CK_VOID_PTR pMutex)
+{
+    static_cast<std::mutex*>(pMutex)->lock();
+    return CKR_OK;
+}
+
+// ---------------------------------------------------------------------------------------------------- 
+CK_RV customUnlockMutex(CK_VOID_PTR pMutex)
+{
+    static_cast<std::mutex*>(pMutex)->unlock();
+    return CKR_OK;
+}
+
+// ---------------------------------------------------------------------------------------------------- 
+int main(int argc, char** argv)
+{
+    if (argc < 2)
+    {
+        printf("Usage: %s <pkcs11 module>\n", __FILE__);
+        return 0;
+    }
+    
+    auto module = C_LoadModule(argv[1], &p11);
     std::string pin = "qwerty";
     std::string aesKeyLabel = "devel3";
     CK_SLOT_ID slotID = 0x8fb33c6;
 
-    CK_RV rv = C_Initialize(NULL);
-    assert(rv == CKR_OK);    
+    CK_C_INITIALIZE_ARGS initArgs;
+    initArgs.flags = CKF_OS_LOCKING_OK;
+    initArgs.pReserved = NULL_PTR;
+    initArgs.CreateMutex = &customCreateMutex;
+    initArgs.DestroyMutex = &customDestroyMutex;
+    initArgs.LockMutex = &customLockMutex;
+    initArgs.UnlockMutex = &customUnlockMutex;
+
+    CK_RV rv;
+    rv = p11->C_Initialize(static_cast<CK_VOID_PTR>(&initArgs));
+
+    checkRV(rv, "C_Initialize failed");
 
     CK_SESSION_HANDLE hSession;
     CK_OBJECT_HANDLE hKey;
     CK_OBJECT_HANDLE hFoundKey;
 
-    printf("VERSION: %s\n", SSLeay_version(SSLEAY_VERSION));
-    
     printSlots();
     createSessionAndLogin(slotID, pin, hSession);
-    generateKey(hSession, aesKeyLabel, hKey);
+    //generateKey(hSession, aesKeyLabel, hKey);
     findObjects(hSession, aesKeyLabel, hFoundKey);
 
     BYTE_VEC cypher;
     encrypt(hSession, hFoundKey, cypher);
     decrypt(hSession, cypher, hFoundKey);
 
-    C_CloseSession(hSession);
-    C_Finalize(NULL);
+    p11->C_CloseSession(hSession);
+    p11->C_Finalize(NULL_PTR);
+    C_UnloadModule(module);
     return 0;
 }
