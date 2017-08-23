@@ -8,5 +8,5 @@ SET(CMAKE_CXX_COMPILER "g++")
 include_directories(/git/OpenSC/src/pkcs11)
 link_directories(/git/OpenSC/src/common/.libs)
 
-add_executable(engine pkcs11_test.cpp)
+add_executable(engine aes_hsm.cpp)
 target_link_libraries (engine pkcs11 scdl dl)
