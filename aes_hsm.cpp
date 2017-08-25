@@ -103,7 +103,7 @@ void createSessionAndLogin(CK_SLOT_ID slotID, const std::string& pin, CK_SESSION
     rv = p11->C_OpenSession(slotID, CKF_SERIAL_SESSION | CKF_RW_SESSION, (CK_VOID_PTR)&ApplicationID, nullptr, &hSession);
     checkRV(rv, hSession, "C_OpenSession failed");
 
-    rv = p11->C_Login(hSession, CKU_USER, userPIN.data(), pin.size());
+    rv = p11->C_Login(hSession, CKU_USER, userPIN.data(), userPIN.size());
     checkRV(rv, hSession, "C_Login failed");
 }
 
